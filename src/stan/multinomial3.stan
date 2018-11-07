@@ -50,10 +50,12 @@ model {
   // model of acres 
   {
     matrix[n_counties, n_crops+1] pred_shares;
+    real sum_pred_shares;
     for(g in 1:n_counties) {
       // predicted market shares given data and parameters
       pred_shares[g,1:n_crops] = shares(n_crops, beta, X[((g-1)*n_crops+1):(g*n_crops)]);
-      pred_shares[g,n_crops+1] = 1 - sum(pred_shares[g,1:n_crops]);
+      sum_pred_shares = sum(pred_shares[g,1:n_crops]);
+      pred_shares[g,n_crops+1] = 1 - sum_pred_shares; //(pred_shares[g,1:n_crops]);
       // acres are measured with multinomial measurement error
       acres[g] ~ multinomial(pred_shares[g]');
     }

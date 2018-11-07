@@ -4,12 +4,27 @@ output: html_notebook
 bibliography: "`r here::here('outputs/library.bib')`"
 ---
 
-# Overview of Berry-Levinsohn-Paker (BLP) / aggregate random coefficients logit approach
+We've been trying to get at this question
 
-The problem: __we don't have individual-level data and choices aren't discrete.__
+> how is projected climate in 2040 likely to affect economic productivity of agriculture and how are producers likely to adapt to maximize their profits?
 
-- If discrete choices: multinomial logit model
-- We just have aggregate crop "shares" as a share of total county acres, so use a __BLP / aggregate random coefficients logit__ model.
+- One method is to do a cross-sectional analysis of counties as in @MendelsohnNordhausShaw1994.
+- Another is a panel/fixed-effects model such as @DeschenesGreenstone2007.
+- A third is a "long differences" approach as in @BurkeEmerick2016.
+- Our approach is to use matching @PotterETAL2018. Here are [slides](https://potterzot.com/research/agClimateImpact/agClimateImpact_SES2018.html).
+
+In that method we take each county in 2040 and find the 2012 county climate that most matches it. The difference between the outcome variable in these two counties is the estimate of the "effect" of the projected climate in 2040. 
+
+We can do that with crop mixes also...
+
+# But can we also look at crop switching directly through a multinomial choice model?
+
+There are 109 different crops crown so probably not, and we don't have individual producer-level information on crop choice.
+
+__But__, we do have aggregate county-level crop mix.
+
+Enter the @BerryETAL1995 (BLP) / aggregate random coefficients logit model
+
 
 ## Model
 
@@ -68,8 +83,10 @@ library(here)   # always know the root of your project
 library(data.table)
 library(gtools) # for the Dirichlet distribution
 library(rstan)  # running STAN models
+library(shinystan) # for model checking
 library(beepr)  # plays noise when you're done
 options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
 
 set.seed(57) #reproducable randomness
 
@@ -138,6 +155,8 @@ res_sample <- stan(model_code = simplest_stan, data = fake_data_list, chains = 3
 
 # Look at chain convergence, pretty good!
 traceplot(res_sample, pars = c("theta"), inc_warmup = TRUE)
+
+shinystan::launch_shinystan(res_sample)
 ```
 
 
@@ -155,7 +174,7 @@ X_long <- matrix(sapply(1:n_counties, function(i) {
 
 # probability of selecting each crop
 beta <- rnorm(k, 0, 1) #coefficients that determine theta
-alpha <- matrix(X_long %*% beta+10, n_counties, n_crops, byrow = TRUE)
+alpha <- matrix(X_long %*% beta+15, n_counties, n_crops, byrow = TRUE)
 theta <- t(sapply(1:n_counties, function(i) { rdirichlet(1, alpha[i,]) }))
 
 # outcomes
@@ -173,7 +192,12 @@ model2 <- stan_model(file = here("src/stan/dirichlet_multinomial.stan")); beepr:
 res_optim <- optimizing(model2, data = fake_data_list)
 
 # use for actual production run
+# ~20 seconds
 res_sample <- stan(file = here("src/stan/dirichlet_multinomial.stan"), data = fake_data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
+pairs(res_sample)
+
+# with adapt_delta
+res_sample <- stan(file = here("src/stan/dirichlet_multinomial.stan"), data = fake_data_list, chains = 3, iter = 1000, warmup = 500, thin = 10, control = list(adapt_delta = 0.99))
 
 # Look at chain convergence, pretty good!
 traceplot(res_sample, pars = c("theta"), inc_warmup = TRUE)
@@ -255,10 +279,9 @@ expose_stan_functions(here("src/stan/multinomial3.stan"))
 res_optim <- optimizing(model, data = data_list)
 
 # use for actual production run
-res_sample <- stan(file = here("src/stan/multinomial3.stan"), data = data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
-
-# Look at chain convergence
-traceplot(res_sample, pars = c("beta"), inc_warmup = TRUE)
+res_sample <- stan(file = here("src/stan/multinomial3.stan"), data = data_list, 
+                   chains = 3, iter = 1000, warmup = 500, thin = 10,
+                   control = list(max_treedepth = 15))
 
 # shinystan
 shinystan::launch_shinystan(res_sample)

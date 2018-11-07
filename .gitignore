@@ -1,3 +1,6 @@
+# don't include compiled stan models
+src/stan/*.rds
+
 # History files
 .Rhistory
 .Rapp.history
