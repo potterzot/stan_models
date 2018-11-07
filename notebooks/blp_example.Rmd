@@ -1,0 +1,268 @@
+---
+title: "The Effect of Climate on Aggregate Crop Choice: Bayesian Modeling with R and STAN"
+output: html_notebook
+bibliography: "`r here::here('outputs/library.bib')`"
+---
+
+# Overview of Berry-Levinsohn-Paker (BLP) / aggregate random coefficients logit approach
+
+The problem: __we don't have individual-level data and choices aren't discrete.__
+
+- If discrete choices: multinomial logit model
+- We just have aggregate crop "shares" as a share of total county acres, so use a __BLP / aggregate random coefficients logit__ model.
+
+## Model
+
+Following @Arriagada2005, production of crop $i$ in county $g$ is undertaken with some production function 
+
+$$q_{ig} = f_i(x_{ig}, z_g),$$ 
+
+where $x_{ig}$ are variable inputs and $z_g$ are exogenous inputs that include weather.
+
+Given crop price $p_i$, the farmer chooses $x_{ig}$ to maximize profits such that
+
+$$\Pi_{ig}(p_i, z_g) = \max \limits_{x_{ig}} \{ p_i q_i (p_i, z_g) - c_i(p_i, z_g) \bar{c}_i\},$$
+
+where $\bar{c}_i$ is the mean cost expenditure for crop $i$.
+
+Given exogenous shocks $z_g$, mean costs $\bar{c}_i$, and prices $p_i$, the farmer chooses the crop that yields the highest profit in that county
+
+$$\Pi_{*g}(p, \bar{c}, z_g) = \max \limits_i \{ \Pi_{ig}(p_i, \bar{c}_i, z_g) \}.$$
+
+Unobserved attributes known to the farmer for crop $i$ in county $g$ and year $t$ are represented by $\alpha_{igt} = \alpha_i + \Delta \alpha_{igt}.$ Then profits are given by
+
+$$\Pi_{igt}(\cdot) = \alpha_i + \Delta \alpha_{igt} + \beta(z_{gt}, \phi_{g}) p_{it} + \delta (z_{gt}, \phi_{g}) \bar{c}_{it} + \varepsilon_{igt},$$
+
+where $\varepsilon_{igt}$ is a mean-zero stochastic term and $\beta(\cdot)$ and $\delta(\cdot)$ are productivity parameters for land in county $g$ given observed and unobserved characteristics $z_{gt}$ and $\phi_g$.
+
+$\beta$ and $\delta$ are random coefficients given by
+
+$$(\beta, \delta) = B + \Lambda z_{gt} + \Sigma \phi_{g}, \phi_g \sim N(0, I)$$
+
+## Need an outside option
+
+An outside option serves as a reference point against which the profit from all crops is measured. Here it is natural to let this be farmland that is fallow/unplanted.
+
+
+# Bayesian modeling
+
+## Workflow
+
+1. Define the model
+2. Create fake data with known parameters
+3. Create a model to estimate those parameters
+4. Check that it correctly estimates
+5. Apply model to estimate parameters for real data
+
+## Useful links
+
+- [STAN Documentation and tutorials]()
+
+
+## Fake data params
+
+Let's set some standard parameters for the fake data we'll generate:
+
+```{r}
+library(here)   # always know the root of your project
+library(data.table)
+library(gtools) # for the Dirichlet distribution
+library(rstan)  # running STAN models
+library(beepr)  # plays noise when you're done
+options(mc.cores = parallel::detectCores())
+
+set.seed(57) #reproducable randomness
+
+# Dimensions of the data. 
+n_ind <- 500     # 500 fake farmers in each county
+n_crops <- 3     # 5 crops
+n_counties <- 50 # 10 counties
+k <- 2           # covariates
+```
+
+## A simple multinomial model
+
+Let's start with just a simple multinomial choice model. Imagine that each county chooses it's crop mix according to the same set of probabilities.
+
+```{r}
+### Generate Fake Data ---------------------------------------------------------
+# total acres for each county
+acres <- rpois(n_counties, 213000) #value comes from the mean acres of all counties
+
+# probability of selecting each crop
+theta <- rdirichlet(1, rnorm(n_crops+1, 5, 1))  #use lognormal because can't have negative probabilities of selection.
+
+# outcomes
+crop_acres <- t(sapply(1:n_counties, function(g) {
+  rmultinom(1, acres[g], theta) 
+  }))
+
+
+### STAN MODEL -----------------------------------------------------------------
+simplest_stan <- 
+'
+// Data block, determines data inputs.
+data {
+  int n_counties;
+  int n_crops;
+  int acres[n_counties, n_crops];
+}
+
+// Parameter block, determines what parameters are allowed
+parameters {
+  simplex[n_crops] theta; //probability of each crop being selected
+}
+
+// Model block, specifies model and priors
+model {
+  // prior on theta
+  theta ~ beta(2,1); 
+  
+  // model
+  for(g in 1:n_counties) {
+    acres[g] ~ multinomial(theta);
+  }
+}
+'
+
+### Build the model and estimate parameter values
+fake_data_list <- list(n_counties = n_counties, n_crops = n_crops+1, acres = crop_acres)
+
+model1 <- stan_model(model_code = simplest_stan); beepr::beep("fanfare")
+
+# use optimization instead of sampling for model development
+res_optim <- optimizing(model1, data = fake_data_list)
+
+# use for actual production run
+res_sample <- stan(model_code = simplest_stan, data = fake_data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
+
+# Look at chain convergence, pretty good!
+traceplot(res_sample, pars = c("theta"), inc_warmup = TRUE)
+```
+
+
+## Okay, now let's make things a little more complex...
+
+The probability of selecting each crop likely depends on some county characteristics such as weather, infrastructure, etc... Let's represent those characteristics by $X$. Also let $theta$ be a function of $X$, so that $\theta \sim \mbox{Dirichlet}(X \beta')$.
+
+```{r}
+### Generate More Fake Data ---------------------------------------------------------
+X <- matrix(rlnorm(n_counties*k, 0, 1), n_counties, k) # county covariates
+X_long <- matrix(sapply(1:n_counties, function(i) { 
+  matrix(rep(X[i,], each = n_crops), nrow = n_crops) 
+  }), ncol = k)
+  
+
+# probability of selecting each crop
+beta <- rnorm(k, 0, 1) #coefficients that determine theta
+alpha <- matrix(X_long %*% beta+10, n_counties, n_crops, byrow = TRUE)
+theta <- t(sapply(1:n_counties, function(i) { rdirichlet(1, alpha[i,]) }))
+
+# outcomes
+crop_acres <- t(sapply(1:n_counties, function(g) {
+  rmultinom(1, acres[g], theta[g,]) 
+  }))
+
+
+### STAN MODEL -----------------------------------------------------------------
+fake_data_list <- list(n_counties = n_counties, n_crops = n_crops, k = k, X = X_long, acres = crop_acres)
+
+model2 <- stan_model(file = here("src/stan/dirichlet_multinomial.stan")); beepr::beep("fanfare")
+
+# use optimization instead of sampling for model development
+res_optim <- optimizing(model2, data = fake_data_list)
+
+# use for actual production run
+res_sample <- stan(file = here("src/stan/dirichlet_multinomial.stan"), data = fake_data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
+
+# Look at chain convergence, pretty good!
+traceplot(res_sample, pars = c("theta"), inc_warmup = TRUE)
+```
+
+## Recovering the coefficients that determine shares
+
+We want to access our betas, and later we want to have more control over how they are determined
+
+```{r}
+# Generate theta shares directly
+beta <- matrix(rnorm(n_crops*k, 0, 1), n_crops, k)
+theta <- t(sapply(1:n_counties, function(i) { 
+  alpha = exp(rowSums(X_long[((i-1)*n_crops + 1):(i*n_crops),] * beta))
+  alpha/(1 + sum(alpha))
+  }))
+theta <- cbind(theta, 1 - rowSums(theta))
+
+# outcomes
+crop_acres <- t(sapply(1:n_counties, function(g) {
+  rmultinom(1, acres[g], theta[g,]) 
+  }))
+
+
+### STAN MODEL -----------------------------------------------------------------
+fake_data_list <- list(n_counties = n_counties, n_crops = n_crops, k = k, X = X_long, acres = crop_acres)
+
+model3 <- stan_model(file = here("src/stan/multinomial2.stan")); beepr::beep("fanfare")
+
+# use optimization instead of sampling for model development
+res_optim <- optimizing(model3, data = fake_data_list)
+colMeans(beta)
+
+# use for actual production run
+res_sample <- stan(file = here("src/stan/multinomial2.stan"), data = fake_data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
+
+# Look at chain convergence, pretty good!
+traceplot(res_sample, pars = c("beta"), inc_warmup = TRUE)
+```
+
+## Now for some real data!
+
+```{r}
+d <- readRDS(here("data/cropmix_sample.rds"))
+d[, `:=`(
+  n_gdd = gdd/max(gdd),
+  n_rain = rain/max(rain),
+  n_days = days/max(days),
+  n_elev = elev/max(elev))]
+
+# Just a subset of crops
+#crop_names <- unique(d$crop)
+crop_names <- c("Alfalfa", "Almonds", "Apples", "Asparagus", "Barley", "Corn", "Pecans", "Spring Wheat", "Winter Wheat")
+d2 <- d[crop %in% crop_names]
+n_counties <- length(unique(d2$fips))
+n_crops <- length(crop_names)
+
+# X matrix
+x_vars <- c("n_gdd", "n_rain", "n_days", "clay", "silt", "sand", "n_elev")
+k <- length(x_vars) + 1
+X <- cbind(1, as.matrix(d2[, x_vars, with=F]))
+
+# Acres
+fallow <- d[crop == "Fallow/Idle Cropland"]$crop_acres
+crop_acres <- matrix(round(c(fallow, d2$crop_acres)), n_counties, n_crops+1) 
+
+# fit using a non-bayesian multinomial model
+X1 <- unique(X) #no duplicate rows
+m <- nnet::multinom(crop_acres ~ X1 - 1)
+
+# Data for our model
+data_list <- list(n_counties = n_counties, n_crops = n_crops, k = k, X = X, acres = crop_acres)
+
+# model
+model <- stan_model(file = here("src/stan/multinomial3.stan")); beepr::beep("fanfare")
+expose_stan_functions(here("src/stan/multinomial3.stan"))
+
+# use optimization instead of sampling for model development
+res_optim <- optimizing(model, data = data_list)
+
+# use for actual production run
+res_sample <- stan(file = here("src/stan/multinomial3.stan"), data = data_list, chains = 3, iter = 1000, warmup = 500, thin = 10)
+
+# Look at chain convergence
+traceplot(res_sample, pars = c("beta"), inc_warmup = TRUE)
+
+# shinystan
+shinystan::launch_shinystan(res_sample)
+```
+
+## References
+
